@@ -1,4 +1,4 @@
-package com.bhuemer.play.api.libs.ws.akka.streams
+package play.api.libs.ws.akka.streams
 
 import akka.stream.FlowMaterializer
 import akka.stream.scaladsl.{Source, Sink}

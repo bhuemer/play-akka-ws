@@ -1,15 +1,17 @@
-package com.bhuemer.play.api.libs.ws.akka
+package play.api.libs.ws.akka
 
+import akka.actor.ActorSystem
+import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.HttpHeader.ParsingResult
 import akka.http.scaladsl.model.StatusCodes.Redirection
-import akka.http.scaladsl.model.headers.Location
+import _root_.akka.http.scaladsl.model.headers.{BasicHttpCredentials, Authorization, Location}
 import akka.http.scaladsl.model._
 import akka.stream.FlowMaterializer
-import akka.stream.scaladsl.{Flow, Sink, Source}
+import akka.stream.scaladsl.{Sink, Source}
 import akka.util.ByteString
-import com.bhuemer.play.api.libs.ws.akka.streams.Streams
 import play.api.libs.iteratee.Enumerator
 import play.api.libs.ws._
+import play.api.libs.ws.akka.streams.Streams
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -17,9 +19,8 @@ import scala.concurrent.{ExecutionContext, Future}
  *
  */
 case class AkkaWSRequestHolder(
-    connection: Flow[HttpRequest, HttpResponse, _],
     uri: Uri,
-    method: String,
+    method: String = "GET",
     body: WSBody = EmptyBody,
     entity: RequestEntity = HttpEntity.Empty,
     headers: Map[String, Seq[String]] = Map(),
@@ -28,8 +29,12 @@ case class AkkaWSRequestHolder(
     followRedirects: Option[Boolean] = None,
     requestTimeout: Option[Int] = None,
     virtualHost: Option[String] = None,
-    proxyServer: Option[WSProxyServer] = None)(implicit materializer: FlowMaterializer)
-   extends WSRequestHolder {
+    proxyServer: Option[WSProxyServer] = None)(implicit actorSystem: ActorSystem, materializer: FlowMaterializer)
+  extends WSRequestHolder {
+
+  import actorSystem.dispatcher
+
+  // -------------------------------------------- WSRequestHolder methods
 
   /** The URL for this request */
   override lazy val url: String = uri.toString()
@@ -41,7 +46,6 @@ case class AkkaWSRequestHolder(
   // TODO: Not supported yet
   override def sign(calc: WSSignatureCalculator) = copy(calc = Some(calc))
 
-  // TODO: Not supported yet
   override def withAuth(username: String, password: String, scheme: WSAuthScheme) =
     copy(auth = Some((username, password, scheme)))
 
@@ -82,7 +86,7 @@ case class AkkaWSRequestHolder(
   }
 
   /** Sets whether redirects (301, 302, ..) should be followed automatically */
-  override def withFollowRedirects(follow: Boolean) = copy(followRedirects = Some(follow))
+  override def withFollowRedirects(followRedirects: Boolean) = copy(followRedirects = Some(followRedirects))
 
   /** Sets the maximum time in milliseconds you expect the request to take. */
   // TODO: Cannot really implement this properly yet, because of https://github.com/akka/akka/issues/17346
@@ -95,8 +99,7 @@ case class AkkaWSRequestHolder(
    * Executes this request
    */
   override def execute(): Future[WSResponse] = {
-    import materializer.executionContext
-    prepareAndExecute.flatMap({ response =>
+    prepareAndExecute().flatMap({ response =>
       response.entity.dataBytes.runFold(ByteString())(_ ++ _).map({ body =>
         new AkkaWSResponse(response, body)
       })
@@ -107,8 +110,7 @@ case class AkkaWSRequestHolder(
    * Executes this request and streams the response body in an enumerator
    */
   override def stream(): Future[(WSResponseHeaders, Enumerator[Array[Byte]])] = {
-    import materializer.executionContext
-    prepareAndExecute.map({ response =>
+    prepareAndExecute().map({ response =>
       val source = response.entity.dataBytes.map(_.toByteBuffer.array())
       (new AkkaWSResponseHeaders(response), Streams.sourceAsEnumerator(source))
     })
@@ -116,28 +118,39 @@ case class AkkaWSRequestHolder(
 
   // -------------------------------------------- Utility methods
 
-  private def prepareAndExecute(implicit ec: ExecutionContext): Future[HttpResponse] = {
+  private def prepareAndExecute(): Future[HttpResponse] = {
+    val connection = Http().outgoingConnection(uri.authority.host.address(), uri.effectivePort)
     val request = HttpRequest()
       .withMethod(
         HttpMethods.getForKey(method).getOrElse(
           HttpMethods.GET
         ))
-      .withHeaders({
-        for {
-          (name, values)  <- headers.toList
-          value           <- values
-          header          <- HttpHeader.parse(name, value) match {
-            case ParsingResult.Ok(header, _) => Some(header)
-            case _ => None
-          }
-        } yield header
-      })
+      .withHeaders(prepareHeaders())
       .withUri(uri)
       .withEntity(entity)
+
     Source.single(request)
       .via(connection)
       .runWith(Sink.head)
-      .flatMap({ response => maybeFollowRedirects(response) })
+      .flatMap({ response =>
+        maybeFollowRedirects(response)
+      })
+  }
+
+  private def prepareHeaders(): List[HttpHeader] = {
+    val headers = for {
+      (name, values)  <- this.headers.toList
+      value           <- values
+      header          <- HttpHeader.parse(name, value) match {
+        case ParsingResult.Ok(header, _) => Some(header)
+        case _ => None
+      }
+    } yield header
+
+    headers ++ auth.collect({
+      // TODO: Support other authentication mechanisms
+      case (username, password, WSAuthScheme.BASIC) => Authorization(BasicHttpCredentials(username, password))
+    })
   }
 
   /**
@@ -157,7 +170,7 @@ case class AkkaWSRequestHolder(
       }
 
     maybeRedirectLocation match {
-      case Some(location) => copy(uri = location.uri).prepareAndExecute
+      case Some(location) => copy(uri = location.uri).prepareAndExecute()
       case _ => Future.successful(response)
     }
   }

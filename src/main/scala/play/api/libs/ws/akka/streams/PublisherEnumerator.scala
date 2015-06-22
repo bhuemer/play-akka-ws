@@ -1,4 +1,4 @@
-package com.bhuemer.play.api.libs.ws.akka.streams
+package play.api.libs.ws.akka.streams
 
 import org.reactivestreams.Publisher
 import play.api.libs.iteratee.{Step, Iteratee, Enumerator}
