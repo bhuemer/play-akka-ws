@@ -11,7 +11,6 @@ import akka.stream.scaladsl.{Sink, Source}
 import akka.util.ByteString
 import play.api.libs.iteratee.Enumerator
 import play.api.libs.ws._
-import play.api.libs.ws.akka.streams.Streams
 
 import scala.concurrent.{ExecutionContext, Future}
 
