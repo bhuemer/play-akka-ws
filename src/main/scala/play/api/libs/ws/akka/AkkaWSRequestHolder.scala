@@ -9,6 +9,7 @@ import akka.http.scaladsl.model._
 import akka.stream.FlowMaterializer
 import akka.stream.scaladsl.{Sink, Source}
 import akka.util.ByteString
+import play.api.http.{ContentTypeOf, Writeable}
 import play.api.libs.iteratee.Enumerator
 import play.api.libs.ws._
 
@@ -82,6 +83,11 @@ case class AkkaWSRequestHolder(
       case InMemoryBody(bytes) => HttpEntity(bytes)
       case _ => HttpEntity.Empty
     })
+  }
+
+  // TODO: Implement me
+  def withBody[E](enumerator: Enumerator[E])(implicit wrt: Writeable[E], ct: ContentTypeOf[E]) = {
+    this
   }
 
   /** Sets whether redirects (301, 302, ..) should be followed automatically */

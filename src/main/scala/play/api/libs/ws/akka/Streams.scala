@@ -1,12 +1,11 @@
 package play.api.libs.ws.akka
 
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference, AtomicLong}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import akka.stream.FlowMaterializer
 import akka.stream.scaladsl.{Sink, Source}
 import org.reactivestreams.{Publisher, Subscriber, Subscription}
-import play.api.libs.iteratee.Input.{EOF, El}
-import play.api.libs.iteratee._
+import play.api.libs.iteratee.{Iteratee, Enumerator, Done, Input, Step}
 import play.api.libs.ws.akka.support.ProducerConsumer
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -23,24 +22,30 @@ object Streams {
 
   def enumeratorAsPublisher[E](enumerator: Enumerator[E])(implicit ec: ExecutionContext): Publisher[E] = new Publisher[E] {
     override def subscribe(subscriber: Subscriber[_ >: E]): Unit = {
+      val iteratee = new SubscriberIt[E](subscriber)
+
+      //
       subscriber.onSubscribe(new Subscription {
         private val initialised = new AtomicBoolean(false)
-        private val iteratee = new SubscriberIteratee[E](subscriber)
 
         override def cancel(): Unit = {
           iteratee.cancel()
         }
 
         override def request(n: Long): Unit = {
-          if (initialised.compareAndSet(false, true)) {
-            enumerator.run(iteratee)
-          }
-
           iteratee.request(n)
+
+          // Once the subscriber has requested at least one element, close the circuit by passing the iteratee
+          // that we have created to the enumerator that was given.
+          if (initialised.compareAndSet(false, true)) {
+            enumerator.run(iteratee.nextState)
+          }
         }
       })
     }
   }
+
+  def enumeratorAsSource[E](enumerator: Enumerator[E])(implicit ec: ExecutionContext): Source[E, Unit] = Source(enumeratorAsPublisher(enumerator))
 
   def sourceAsEnumerator[E](source: Source[E, _])(implicit materializer: FlowMaterializer, ec: ExecutionContext): Enumerator[E] =
     publisherAsEnumerator(source.runWith(Sink.publisher))(ec)
@@ -75,71 +80,37 @@ object Streams {
     /**
      * This is the state the iteratee is in when we know that we can expect more input.
      */
-    def consumeElements(): Iteratee[E, Unit] = new Iteratee[E, Unit] {
+    def consumeElements(): Iteratee[E, Unit] = new Iteratee[E, Unit] { self =>
       override def fold[B](folder: Step[E, Unit] => Future[B])(implicit ec: ExecutionContext): Future[B] = {
         folder(Step.Cont({
-          case in @ Input.El(elem) =>
+          case in@Input.El(elem) =>
             subscriber.onNext(elem)
             nextState
 
-          case in @ Input.EOF =>
+          case in@Input.EOF =>
             subscriber.onComplete()
             Done((), in)
 
           // This one we'll just ignore and stay in the current state
-          case Input.Empty => consumeElements()
+          case Input.Empty => self
         }))
       }
+    }
 
-      def request(n: Long): Unit = {
-        (0l until n) foreach { _ =>
-          states.offer(consumeElements())
-        }
-      }
-
-      def cancel(): Unit = {
-        states.offerFirst(Done((), Input.Empty))
+    /**
+     * Will be called whenever the subscriber requests more elements via its subscription.
+     */
+    def request(n: Long): Unit = {
+      (0l until n) foreach { _ =>
+        states.offer(consumeElements())
       }
     }
 
+    def cancel(): Unit = {
+      states.offerFirst(Done((), Input.Empty))
+    }
   }
 
-  private class SubscriberIteratee[E](subscriber: Subscriber[_ >: E]) extends Iteratee[E, Any] with Subscription {
-
-    private val numberOfRequested = new AtomicLong()
-    private val iterateeRef = new AtomicReference(Promise[Iteratee[E, Any]]())
-
-    // ------------------------------------------ Iteratee methods
-
-    override def fold[B](folder: Step[E, Any] => Future[B])(implicit ec: ExecutionContext): Future[B] = {
-      val next = Iteratee.flatten(iterateeRef.get.future)
-      folder(Step.Cont({
-        case Input.El(elem) =>
-          subscriber.onNext(elem)
-          next
-
-        case Input.EOF      =>
-          subscriber.onComplete()
-          next
-
-        case Input.Empty    =>
-          next
-      }))
-    }
-
-    // ------------------------------------------ Subscription methods
-
-    override def request(n: Long): Unit = {
-      if (numberOfRequested.addAndGet(n) > 0) {
-
-      }
-    }
-
-    override def cancel(): Unit = {
-
-    }
-
-  }
 
   /**
    * @param k the initial continuation for the iteratee, if we're not in the Cont state, we can't create such a subscriber
@@ -166,7 +137,7 @@ object Streams {
       // Note that this method assumes that it won't be called if we haven't requested anything yet / it won't be
       // called more often than we requested yet. Of course, that's exactly what the reactive subscriber trait
       // is supposed to guarantee anyway. We're just not doing any safety checks in addition.
-      k(El(element)).pureFold({
+      k(Input.El(element)).pureFold({
         case Step.Cont(nextK) =>
           k = nextK
           requestNext()
@@ -177,7 +148,7 @@ object Streams {
     /** If the upstream publisher received an error, we'll just pass it along. */
     override def onError(t: Throwable): Unit = completeWith(Failure(t))
 
-    override def onComplete(): Unit = completeWith(Success(k(EOF)))
+    override def onComplete(): Unit = completeWith(Success(k(Input.EOF)))
 
     // -------------------------------------------- Utility methods
 
