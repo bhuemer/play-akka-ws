@@ -157,6 +157,8 @@ object Streams {
        * Takes the given Iteratee and determines the current state for this overall subscriber.
        */
       def determineState(it: Iteratee[E, A], mostRecentInput: Input[E] = Input.Empty): Unit = {
+        currentState = Folding(it, mostRecentInput)
+
         it.pureFold({
           case Step.Cont(k) =>
             currentState = Active(k, mostRecentInput)
@@ -174,6 +176,7 @@ object Streams {
         })
       }
 
+      /** Fulfills the promise, cancels the subscription and generally does */
       def completeWith(result: Try[Iteratee[E, A]]): Unit = {
         subscription.cancel()
         currentState = Completed
@@ -191,10 +194,23 @@ object Streams {
       case class Active(k: Input[E] => Iteratee[E, A], mostRecentInput: Input[E]) extends Subscriber[E] {
         override def onSubscribe(s: Subscription): Unit = onAlreadySubscribed
         override def onNext(elem: E): Unit              = determineState(k(Input.El(elem)), Input.El(elem))
-        override def onComplete(): Unit                 = determineState(k(Input.EOF), Input.EOF)
-        override def onError(error: Throwable): Unit    = determineState(
+        override def onComplete(): Unit                 = completeWith(Success(k(Input.EOF)))
+        override def onError(error: Throwable): Unit    = completeWith(Success(
           Error(s"After processing $mostRecentInput eventually " +
-            s"we encountered the exception: ${error.getMessage}, \n$error", mostRecentInput), mostRecentInput)
+            s"we encountered the exception: ${error.getMessage}, \n$error", mostRecentInput)))
+      }
+
+      // Just makes sure that we don't receive anything else in the meantime, while we're trying to figure out
+      // whether or not we should continue receiving input from the iteratee (by folding over it).
+      case class Folding(current: Iteratee[E, A], mostRecentInput: Input[E]) extends Subscriber[E] {
+        override def onSubscribe(s: Subscription): Unit = onAlreadySubscribed
+        override def onNext(elem: E): Unit              = completeWith(Success(
+          Error(s"Received addition input while we're still foldering over the current iteratee's state, i.e. " +
+            s"we haven't requested this element at all!", Input.El(elem))))
+        override def onComplete(): Unit                 = completeWith(Success(current))
+        override def onError(error: Throwable): Unit    = completeWith(Success(
+          Error(s"While we're still folding over $mostRecentInput eventually " +
+            s"we encountered the exception: ${error.getMessage}, \n$error", mostRecentInput)))
       }
 
       // Like either a DoneIteratee or ErrorIteratee. In the world of reactive streams, there's no distinction.
