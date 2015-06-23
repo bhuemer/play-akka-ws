@@ -22,23 +22,26 @@ object Streams {
 
   def enumeratorAsPublisher[E](enumerator: Enumerator[E])(implicit ec: ExecutionContext): Publisher[E] = new Publisher[E] {
     override def subscribe(subscriber: Subscriber[_ >: E]): Unit = {
-      val iteratee = new SubscriberIt[E](subscriber)
-
-      //
+      val iteratee = new SubscriberIteratee[E](subscriber)
       subscriber.onSubscribe(new Subscription {
         private val initialised = new AtomicBoolean(false)
 
-        override def cancel(): Unit = {
-          iteratee.cancel()
-        }
+        /** Whenever the subscriber wants to cancel the subscription, make sure that the Iteratee transitions into `Done`. */
+        override def cancel(): Unit = iteratee.cancel()
 
+        /**  */
         override def request(n: Long): Unit = {
           iteratee.request(n)
 
-          // Once the subscriber has requested at least one element, close the circuit by passing the iteratee
-          // that we have created to the enumerator that was given.
+          // Once the subscriber has requested at least one element, close the circuit by passing the Iteratee
+          // that we have created to the enumerator that was given. This basically makes sure that we only bother
+          // to evaluate the Enumerator in case we actually need to.
           if (initialised.compareAndSet(false, true)) {
-            enumerator.run(iteratee.nextState)
+            enumerator.run(iteratee)
+              .onFailure({
+                // TODO: Is it okay to deliver this onError callback even if the subscriber cancelled the subscription already?
+                case error => subscriber.onError(error)
+              })
           }
         }
       })
@@ -66,35 +69,24 @@ object Streams {
 
   // -------------------------------------------- Utility classes
 
-  private class SubscriberIt[E](subscriber: Subscriber[_ >: E]) {
+  private class SubscriberIteratee[E](subscriber: Subscriber[_ >: E]) extends Iteratee[E, Unit] { self =>
 
     private val states = new ProducerConsumer[Iteratee[E, Unit]]()
 
     /**
-     * Depending on the number of elements that have been requested from the subscriber, this will
-     * return a different state for an iteratee. Either we'll wait for these requests to happen, via
-     * the subscription, or we'll keep on consuming elements from the enumerator.
+     * Will always delegate to our dequeue of iteratee states.
+     *
+     * Depending on the number of elements that have been requested from the subscriber, this will either return
+     * a pending future that may/may not consume elements eventually, or it's an immediate consumeElements() /
+     * Done state.
      */
-    def nextState(implicit ec: ExecutionContext): Iteratee[E, Unit] = Iteratee.flatten(states.take)
-
-    /**
-     * This is the state the iteratee is in when we know that we can expect more input.
-     */
-    def consumeElements(): Iteratee[E, Unit] = new Iteratee[E, Unit] { self =>
-      override def fold[B](folder: Step[E, Unit] => Future[B])(implicit ec: ExecutionContext): Future[B] = {
-        folder(Step.Cont({
-          case in@Input.El(elem) =>
-            subscriber.onNext(elem)
-            nextState
-
-          case in@Input.EOF =>
-            subscriber.onComplete()
-            Done((), in)
-
-          // This one we'll just ignore and stay in the current state
-          case Input.Empty => self
-        }))
-      }
+    override def fold[B](folder: (Step[E, Unit]) => Future[B])(implicit ec: ExecutionContext): Future[B] = {
+      states.take.flatMap({ it =>
+        // `it` represents the current state of this Iteratee, usually either what's returned by
+        // `consumeElements()` or it's the Done state. Error states cannot really occur, because subscribers
+        // cannot propagate those back to publishers.
+        it.fold(folder)
+      })
     }
 
     /**
@@ -107,7 +99,31 @@ object Streams {
     }
 
     def cancel(): Unit = {
+      // Skip any other consuleElements() states that are enqueued already and go into the Done state as
+      // quickly as possible. There might still be one #fold happening that leads to a call to
+      // consumeElements() -> subscriber.onNext(), but that can only happen, if the subscriber requested
+      // more than one element and some are still in-flight while he/she decided to cancel the subscription.
       states.offerFirst(Done((), Input.Empty))
+    }
+
+    /**
+     * This is the state the iteratee is in when we know that we can expect more input.
+     */
+    private def consumeElements(): Iteratee[E, Unit] = new Iteratee[E, Unit] {
+      override def fold[B](folder: Step[E, Unit] => Future[B])(implicit ec: ExecutionContext): Future[B] = {
+        folder(Step.Cont({
+          case in@Input.El(elem) =>
+            subscriber.onNext(elem)
+            self
+
+          case in@Input.EOF =>
+            subscriber.onComplete()
+            Done((), in)
+
+          // This one we'll just ignore and stay in the current state
+          case Input.Empty => consumeElements()
+        }))
+      }
     }
   }
 
