@@ -4,7 +4,7 @@ import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.HttpHeader.ParsingResult
 import akka.http.scaladsl.model.StatusCodes.Redirection
-import _root_.akka.http.scaladsl.model.headers.{BasicHttpCredentials, Authorization, Location}
+import akka.http.scaladsl.model.headers.{BasicHttpCredentials, Authorization, Location}
 import akka.http.scaladsl.model._
 import akka.stream.FlowMaterializer
 import akka.stream.scaladsl.{Sink, Source}
