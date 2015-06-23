@@ -12,6 +12,7 @@ import akka.util.ByteString
 import play.api.http.{ContentTypeOf, Writeable}
 import play.api.libs.iteratee.Enumerator
 import play.api.libs.ws._
+import play.api.libs.ws.akka.support.Streams
 
 import scala.concurrent.{ExecutionContext, Future}
 

@@ -1,12 +1,11 @@
-package play.api.libs.ws.akka
+package play.api.libs.ws.akka.support
 
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+import java.util.concurrent.atomic.AtomicBoolean
 
 import akka.stream.FlowMaterializer
 import akka.stream.scaladsl.{Sink, Source}
 import org.reactivestreams.{Publisher, Subscriber, Subscription}
-import play.api.libs.iteratee.{Iteratee, Enumerator, Done, Input, Step}
-import play.api.libs.ws.akka.support.ProducerConsumer
+import play.api.libs.iteratee.{Done, Error, Enumerator, Input, Iteratee, Step}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
@@ -55,15 +54,9 @@ object Streams {
 
   def publisherAsEnumerator[E](publisher: Publisher[E])(implicit ec: ExecutionContext): Enumerator[E] = new Enumerator[E] {
     override def apply[A](it: Iteratee[E, A]): Future[Iteratee[E, A]] = {
-      it.fold({
-        case Step.Cont(k) =>
-          val nextIt = Promise[Iteratee[E, A]]()
-          publisher.subscribe(new IterateeSubscriber(k, nextIt)(ec))
-          nextIt.future
-
-        // If the iteratee is in a Done/Error state, we don't even need to create a subscription
-        case otherwise => Future.successful(otherwise.it)
-      })(ec)
+      val nextIt = Promise[Iteratee[E, A]]()
+      publisher.subscribe(new IterateeSubscriber(it, nextIt)(ec))
+      nextIt.future
     }
   }
 
@@ -127,63 +120,92 @@ object Streams {
     }
   }
 
+  private class IterateeSubscriber[E, A](it0: Iteratee[E, A], outcome: Promise[Iteratee[E, A]])(implicit ec: ExecutionContext) extends Subscriber[E] {
 
-  /**
-   * @param k the initial continuation for the iteratee, if we're not in the Cont state, we can't create such a subscriber
-   * @param outcome the promise that we'll fulfill eventually with the final state of the iteratee
-   */
-  private class IterateeSubscriber[E, A](
-      @volatile private var k: Input[E] => Iteratee[E, A],
-      outcome: Promise[Iteratee[E, A]])(implicit ec: ExecutionContext) extends Subscriber[E] {
+    @volatile private var currentState: Subscriber[E] = WaitingForSubscription
 
-    private val subscriptionRef: AtomicReference[Subscription] = new AtomicReference(null)
+    // ------------------------------------------ Subscriber methods
 
-    // -------------------------------------------- Subscriber methods
+    // They always simply delegate to the current state's implementations
+    override def onSubscribe(s: Subscription): Unit = currentState.onSubscribe(s)
+    override def onNext(e: E): Unit                 = currentState.onNext(e)
+    override def onComplete(): Unit                 = currentState.onComplete()
+    override def onError(t: Throwable): Unit        = currentState.onError(t)
 
-    override def onSubscribe(sub: Subscription): Unit = {
-      if (subscriptionRef.compareAndSet(null, sub)) {
-        requestNext()
-      } else {
-        // This shouldn't happen ..
-        sub.cancel()
+    // ------------------------------------------ Subscription states
+
+    object WaitingForSubscription extends Subscriber[E] {
+      override def onSubscribe(subscription: Subscription): Unit = {
+        // Now that we have our subscription, use that and the initial state of the iteratee
+        // to determine the new current state of this subscriber. Either we'll continue receiving
+        // elements (if it's a Cont iteratee) or we'll just finish the subscription right away.
+        GainedSubscription(subscription).determineState(it0)
       }
+
+      override def onError(error: Throwable): Unit = onNotYetSubscribed
+      override def onNext(elem: E): Unit           = onNotYetSubscribed
+      override def onComplete(): Unit              = onNotYetSubscribed
+
+      def onNotYetSubscribed: Nothing = throw new IllegalStateException(
+        "No subscription has been provided yet, so we shouldn't receive " +
+          "any of these onError/onNext/onComplete callbacks.")
     }
 
-    override def onNext(element: E): Unit = {
-      // Note that this method assumes that it won't be called if we haven't requested anything yet / it won't be
-      // called more often than we requested yet. Of course, that's exactly what the reactive subscriber trait
-      // is supposed to guarantee anyway. We're just not doing any safety checks in addition.
-      k(Input.El(element)).pureFold({
-        case Step.Cont(nextK) =>
-          k = nextK
-          requestNext()
-        case otherwise => completeWith(Success(otherwise.it))
-      })(ec)
+    case class GainedSubscription(subscription: Subscription) {
+
+      /**
+       * Takes the given Iteratee and determines the current state for this overall subscriber.
+       */
+      def determineState(it: Iteratee[E, A], mostRecentInput: Input[E] = Input.Empty): Unit = {
+        it.pureFold({
+          case Step.Cont(k) =>
+            currentState = Active(k, mostRecentInput)
+
+            // We simply request elements one-by-one
+            subscription.request(1)
+
+          // The Iteratee already is either in the Done or Error state
+          case otherwise =>
+            completeWith(Success(otherwise.it))
+
+        }).onFailure({
+          case error => completeWith(Failure(new RuntimeException(
+            s"After processing $mostRecentInput eventually we encountered the exception: ${error.getMessage}, \n$error", error)))
+        })
+      }
+
+      def completeWith(result: Try[Iteratee[E, A]]): Unit = {
+        subscription.cancel()
+        currentState = Completed
+        outcome.tryComplete(result)
+      }
+
+      /** Handles superfluous onSubscribe callbacks in states where we have a subscription already. */
+      def onAlreadySubscribed: Nothing = throw new IllegalStateException(
+        "Please don't use this subscriber for more than one subscription. You cannot subscribe to two publishers " +
+          "at the same time with this anyway and if you want to subscribe to many publishers sequentially, " +
+          "then please just use the Iteratee that came out of this one and create another subscriber wrapper " +
+          "around it.")
+
+      // Like a ContIteratee
+      case class Active(k: Input[E] => Iteratee[E, A], mostRecentInput: Input[E]) extends Subscriber[E] {
+        override def onSubscribe(s: Subscription): Unit = onAlreadySubscribed
+        override def onNext(elem: E): Unit              = determineState(k(Input.El(elem)), Input.El(elem))
+        override def onComplete(): Unit                 = determineState(k(Input.EOF), Input.EOF)
+        override def onError(error: Throwable): Unit    = determineState(
+          Error(s"After processing $mostRecentInput eventually " +
+            s"we encountered the exception: ${error.getMessage}, \n$error", mostRecentInput), mostRecentInput)
+      }
+
+      // Like either a DoneIteratee or ErrorIteratee. In the world of reactive streams, there's no distinction.
+      object Completed extends Subscriber[E] {
+        override def onSubscribe(s: Subscription): Unit = onAlreadySubscribed
+        override def onError(error: Throwable): Unit = ()
+        override def onNext(elem: E): Unit = ()
+        override def onComplete(): Unit = ()
+      }
+
     }
-
-    /** If the upstream publisher received an error, we'll just pass it along. */
-    override def onError(t: Throwable): Unit = completeWith(Failure(t))
-
-    override def onComplete(): Unit = completeWith(Success(k(Input.EOF)))
-
-    // -------------------------------------------- Utility methods
-
-    protected def requestNext(): Unit = {
-      val subscription = Option(subscriptionRef.get()).getOrElse(
-        throw new IllegalStateException(
-          "Tried to access the current subscription without it being initialized yet.")
-      )
-
-      subscription.request(1)
-    }
-
-    private def completeWith(result: Try[Iteratee[E, A]]): Unit = {
-      // No matter whether we've encountered a Done or Error state for the
-      // next iteratee, we need to cancel the subscription in any case.
-      Option(subscriptionRef.get()).foreach(_.cancel())
-      outcome.complete(result)
-    }
-
   }
 
 }

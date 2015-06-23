@@ -46,7 +46,11 @@ class ProducerConsumer[A] {
   }
 
   /**
-   * Note that the way this is implemented, we don't offer any kind of order ..
+   * The intention of this method is to have something like [[java.util.concurrent.BlockingDeque#take(]] without
+   * actually blocking the current thread. If no element is available at the moment, then we'll just return a
+   * pending future that will eventually resolve to an element that has been offered.
+   *
+   * Note that the way this is implemented, we don't guarantee any kind of order .. so, for example:
    *
    * #1 offer
    * #1 take -> receives #1
@@ -61,24 +65,27 @@ class ProducerConsumer[A] {
    */
   def take(implicit ec: ExecutionContext): Future[A] = {
     val result = elements.poll()
+
+    // We cannot insert `null` elements, so whenever this collection returns `null`,
+    // we know that it is empty and that we'll need to wait for more elements.
     if (result != null) {
       Future.successful(result)
     } else {
       // If someone already created a promise to listen on, use that one. We're
       // doing something like a wait/notifyAll here, so all consumers waiting for
       // more elements will be woken up at once.
-      val promise = notEmpty.updateAndGet(unary({
+      notEmpty.updateAndGet(unary({
         case Some(previous) => Some(previous)
         case None           => Some(Promise[Unit]())
-      }))
-
-      promise.get.future.flatMap({ _ =>
-        // .. now try again, only one of the consumers will succeed though.
+      })).get.future.flatMap({ _ =>
+        // .. now try again, only one of the consumers will succeed though. The
+        // others will continue waiting until more elements are offered.
         take
       })
     }
   }
 
+  // to get rid of ugly syntax
   private def unary[T](body: T => T): UnaryOperator[T] = new UnaryOperator[T] {
     override def apply(t: T): T = body(t)
   }
