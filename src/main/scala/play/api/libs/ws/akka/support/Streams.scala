@@ -19,46 +19,63 @@ object Streams {
 
   // -------------------------------------------- Public methods
 
-  def enumeratorAsPublisher[E](enumerator: Enumerator[E])(implicit ec: ExecutionContext): Publisher[E] = new Publisher[E] {
-    override def subscribe(subscriber: Subscriber[_ >: E]): Unit = {
-      val iteratee = new SubscriberIteratee[E](subscriber)
-      subscriber.onSubscribe(new Subscription {
-        private val initialised = new AtomicBoolean(false)
+  def subscriberAsIteratee[E](subscriber: Subscriber[E])(implicit ec: ExecutionContext): Iteratee[E, Unit] =
+    new SubscriberIteratee(subscriber)
 
-        /** Whenever the subscriber wants to cancel the subscription, make sure that the Iteratee transitions into `Done`. */
-        override def cancel(): Unit = iteratee.cancel()
-
-        /**  */
-        override def request(n: Long): Unit = {
-          iteratee.request(n)
-
-          // Once the subscriber has requested at least one element, close the circuit by passing the Iteratee
-          // that we have created to the enumerator that was given. This basically makes sure that we only bother
-          // to evaluate the Enumerator in case we actually need to.
-          if (initialised.compareAndSet(false, true)) {
-            enumerator.run(iteratee)
-              .onFailure({
-                // TODO: Is it okay to deliver this onError callback even if the subscriber cancelled the subscription already?
-                case error => subscriber.onError(error)
-              })
-          }
-        }
-      })
-    }
+  def iterateeAsSubscriber[E, A](iteratee: Iteratee[E, A])(implicit ec: ExecutionContext): (Subscriber[E], Iteratee[E, A]) = {
+    val outcome = Promise[Iteratee[E, A]]()
+    (new IterateeSubscriber(iteratee, outcome), Iteratee.flatten(outcome.future))
   }
 
-  def enumeratorAsSource[E](enumerator: Enumerator[E])(implicit ec: ExecutionContext): Source[E, Unit] = Source(enumeratorAsPublisher(enumerator))
+  def enumeratorAsPublisher[E](enumerator: Enumerator[E])(implicit ec: ExecutionContext): Publisher[E] =
+    new Publisher[E] {
+      override def subscribe(subscriber: Subscriber[_ >: E]): Unit = {
+        val iteratee = new SubscriberIteratee[E](subscriber)
+        subscriber.onSubscribe(new Subscription {
+          private val initialised = new AtomicBoolean(false)
 
-  def sourceAsEnumerator[E](source: Source[E, _])(implicit materializer: FlowMaterializer, ec: ExecutionContext): Enumerator[E] =
+          /**
+           * Whenever the subscriber wants to cancel the subscription,
+           * make sure that the Iteratee transitions into `Done`.
+           */
+          override def cancel(): Unit = iteratee.cancel()
+
+          /**  */
+          override def request(n: Long): Unit = {
+            iteratee.request(n)
+
+            // Once the subscriber has requested at least one element, close the circuit by passing the Iteratee
+            // that we have created to the enumerator that was given. This basically makes sure that we only bother
+            // to evaluate the Enumerator in case we actually need to.
+            if (initialised.compareAndSet(false, true)) {
+              enumerator.run(iteratee)
+                .onFailure({
+                  // TODO: Is it okay to deliver this onError callback even if
+                  // the subscriber cancelled the subscription already? Otherwise
+                  // we should just log this exception somehow ..
+                  case error => subscriber.onError(error)
+                })
+            }
+          }
+        })
+      }
+    }
+
+  def enumeratorAsSource[E](enumerator: Enumerator[E])(implicit ec: ExecutionContext): Source[E, Unit] =
+    Source(enumeratorAsPublisher(enumerator))
+
+  def sourceAsEnumerator[E](source: Source[E, _])
+                         (implicit materializer: FlowMaterializer, ec: ExecutionContext): Enumerator[E] =
     publisherAsEnumerator(source.runWith(Sink.publisher))(ec)
 
-  def publisherAsEnumerator[E](publisher: Publisher[E])(implicit ec: ExecutionContext): Enumerator[E] = new Enumerator[E] {
-    override def apply[A](it: Iteratee[E, A]): Future[Iteratee[E, A]] = {
-      val nextIt = Promise[Iteratee[E, A]]()
-      publisher.subscribe(new IterateeSubscriber(it, nextIt)(ec))
-      nextIt.future
+  def publisherAsEnumerator[E](publisher: Publisher[E])(implicit ec: ExecutionContext): Enumerator[E] =
+    new Enumerator[E] {
+      override def apply[A](it: Iteratee[E, A]): Future[Iteratee[E, A]] = {
+        val nextIt = Promise[Iteratee[E, A]]()
+        publisher.subscribe(new IterateeSubscriber(it, nextIt)(ec))
+        nextIt.future
+      }
     }
-  }
 
   // -------------------------------------------- Utility classes
 
@@ -120,7 +137,9 @@ object Streams {
     }
   }
 
-  private class IterateeSubscriber[E, A](it0: Iteratee[E, A], outcome: Promise[Iteratee[E, A]])(implicit ec: ExecutionContext) extends Subscriber[E] {
+  private class IterateeSubscriber[E, A](it0: Iteratee[E, A], outcome: Promise[Iteratee[E, A]])
+                                          (implicit ec: ExecutionContext)
+      extends Subscriber[E] {
 
     @volatile private var currentState: Subscriber[E] = WaitingForSubscription
 
