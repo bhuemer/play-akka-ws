@@ -86,15 +86,19 @@ object Streams {
     /**
      * Will always delegate to our dequeue of iteratee states.
      *
-     * Depending on the number of elements that have been requested from the subscriber, this will either return
-     * a pending future that may/may not consume elements eventually, or it's an immediate consumeElements() /
-     * Done state.
+     * Three things that can happen:
+     *  - The Enumerator is trying to push elements into this Iteratee that we haven't requested yet, e.g.
+     *    because we haven't requested anything at all yet - only just created this Iteratee - or the subscriber
+     *    has not requested more: In this case the `states` dequeue will return only a pending Future when you
+     *    call `take` ... which means, we'll wait until there's a state available (but without blocking the thread).
+     *  - The Enumerator is pushing elements into this Iteratee that we have indeed requested, in which
+     *    case `states.take` will return an immediately successful Future containing `ConsumeElements`.
+     *  - Likewise for the `Done` state if the subscriber has completed the subscription.
      */
     override def fold[B](folder: (Step[E, Unit]) => Future[B])(implicit ec: ExecutionContext): Future[B] = {
       states.take.flatMap({ it =>
-        // `it` represents the current state of this Iteratee, usually either what's returned by
-        // `consumeElements()` or it's the Done state. Error states cannot really occur, because subscribers
-        // cannot propagate those back to publishers.
+        // `it` represents the current state of this Iteratee, either `ConsumeElements` or it's the Done state.
+        // Error states cannot really occur, because subscribers cannot propagate those back to publishers.
         it.fold(folder)
       })
     }
@@ -104,34 +108,34 @@ object Streams {
      */
     def request(n: Long): Unit = {
       (0l until n) foreach { _ =>
-        states.offer(consumeElements())
+        states.offer(ConsumeElements)
       }
     }
 
     def cancel(): Unit = {
-      // Skip any other consuleElements() states that are enqueued already and go into the Done state as
+      // Skip any other `ConsumeElements` states that are enqueued already and go into the Done state as
       // quickly as possible. There might still be one #fold happening that leads to a call to
-      // consumeElements() -> subscriber.onNext(), but that can only happen, if the subscriber requested
-      // more than one element and some are still in-flight while he/she decided to cancel the subscription.
+      // ConsumeElements -> subscriber.onNext(), but that can only happen, if the subscriber requested
+      // more than one element and some are still in-flight while it decided to cancel the subscription.
       states.offerFirst(Done((), Input.Empty))
     }
 
     /**
      * This is the state the iteratee is in when we know that we can expect more input.
      */
-    private def consumeElements(): Iteratee[E, Unit] = new Iteratee[E, Unit] {
+    private object ConsumeElements extends Iteratee[E, Unit] {
       override def fold[B](folder: Step[E, Unit] => Future[B])(implicit ec: ExecutionContext): Future[B] = {
         folder(Step.Cont({
-          case in@Input.El(elem) =>
+          case Input.El(elem) =>
             subscriber.onNext(elem)
             self
 
-          case in@Input.EOF =>
+          case Input.EOF =>
             subscriber.onComplete()
-            Done((), in)
+            Done((), Input.EOF)
 
           // This one we'll just ignore and stay in the current state
-          case Input.Empty => consumeElements()
+          case Input.Empty => ConsumeElements
         }))
       }
     }

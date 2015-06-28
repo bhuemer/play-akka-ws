@@ -4,7 +4,7 @@ import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.HttpHeader.ParsingResult
 import akka.http.scaladsl.model.StatusCodes.Redirection
-import akka.http.scaladsl.model.headers.{BasicHttpCredentials, Authorization, Location}
+import akka.http.scaladsl.model.headers.{GenericHttpCredentials, BasicHttpCredentials, Authorization, Location}
 import akka.http.scaladsl.model._
 import akka.stream.FlowMaterializer
 import akka.stream.scaladsl.{Sink, Source}
@@ -153,10 +153,7 @@ case class AkkaWSRequestHolder(
       }
     } yield header
 
-    headers ++ auth.collect({
-      // TODO: Support other authentication mechanisms
-      case (username, password, WSAuthScheme.BASIC) => Authorization(BasicHttpCredentials(username, password))
-    })
+    headers ++ AuthenticationUtils.computeAuthenticationHeader(auth)
   }
 
   /**
@@ -179,6 +176,31 @@ case class AkkaWSRequestHolder(
       case Some(location) => copy(uri = location.uri).prepareAndExecute()
       case _ => Future.successful(response)
     }
+  }
+
+}
+
+object AuthenticationUtils {
+
+  def computeAuthenticationHeader(authentication: Option[(String, String, WSAuthScheme)]): Option[HttpHeader] = {
+    authentication.collect({
+      case (username, password, WSAuthScheme.BASIC) => Authorization(BasicHttpCredentials(username, password))
+      case (username, password, WSAuthScheme.DIGEST) =>
+        import com.ning.http.client.Realm
+        import com.ning.http.client.Realm.RealmBuilder
+        import com.ning.http.util.AuthenticatorUtils
+
+        val token = AuthenticatorUtils.computeDigestAuthentication(new RealmBuilder()
+          .setScheme(Realm.AuthScheme.DIGEST)
+          .setPrincipal(username)
+          .setPassword(password)
+          .setUsePreemptiveAuth(true)
+          .build())
+        Authorization(GenericHttpCredentials("DIGEST",
+          token.substring("DIGEST ".length)))
+
+      // TODO: Support other authentication mechanisms
+    })
   }
 
 }
