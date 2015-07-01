@@ -19,14 +19,6 @@ object Streams {
 
   // -------------------------------------------- Public methods
 
-  def subscriberAsIteratee[E](subscriber: Subscriber[E])(implicit ec: ExecutionContext): Iteratee[E, Unit] =
-    new SubscriberIteratee(subscriber)
-
-  def iterateeAsSubscriber[E, A](iteratee: Iteratee[E, A])(implicit ec: ExecutionContext): (Subscriber[E], Iteratee[E, A]) = {
-    val outcome = Promise[Iteratee[E, A]]()
-    (new IterateeSubscriber(iteratee, outcome), Iteratee.flatten(outcome.future))
-  }
-
   def enumeratorAsPublisher[E](enumerator: Enumerator[E])(implicit ec: ExecutionContext): Publisher[E] =
     new Publisher[E] {
       override def subscribe(subscriber: Subscriber[_ >: E]): Unit = {
@@ -34,13 +26,8 @@ object Streams {
         subscriber.onSubscribe(new Subscription {
           private val initialised = new AtomicBoolean(false)
 
-          /**
-           * Whenever the subscriber wants to cancel the subscription,
-           * make sure that the Iteratee transitions into `Done`.
-           */
           override def cancel(): Unit = iteratee.cancel()
 
-          /**  */
           override def request(n: Long): Unit = {
             iteratee.request(n)
 
@@ -96,16 +83,17 @@ object Streams {
      *  - Likewise for the `Done` state if the subscriber has completed the subscription.
      */
     override def fold[B](folder: (Step[E, Unit]) => Future[B])(implicit ec: ExecutionContext): Future[B] = {
-      states.take.flatMap({ it =>
+      val next: Future[Iteratee[E, Unit]] = states.take
+      next.flatMap({ it =>
         // `it` represents the current state of this Iteratee, either `ConsumeElements` or it's the Done state.
-        // Error states cannot really occur, because subscribers cannot propagate those back to publishers.
+        // Error states cannot really occur, because subscribers cannot propagate those back to publishers, i.e.
+        // the given subscriber cannot let this iteratee know that it's in an error state (other than throwing
+        // exceptions from `subscriber.onNext()` etc. which would end up as a failed future atm.
         it.fold(folder)
       })
     }
 
-    /**
-     * Will be called whenever the subscriber requests more elements via its subscription.
-     */
+    /** Will be called whenever the subscriber requests more elements via its subscription. */
     def request(n: Long): Unit = {
       (0l until n) foreach { _ =>
         states.offer(ConsumeElements)
@@ -117,6 +105,7 @@ object Streams {
       // quickly as possible. There might still be one #fold happening that leads to a call to
       // ConsumeElements -> subscriber.onNext(), but that can only happen, if the subscriber requested
       // more than one element and some are still in-flight while it decided to cancel the subscription.
+      // see also: https://github.com/reactive-streams/reactive-streams-jvm/blob/v1.0.0/README.md#2.8
       states.offerFirst(Done((), Input.Empty))
     }
 
@@ -141,6 +130,11 @@ object Streams {
     }
   }
 
+  /**
+   * Allows us to treat iteratees as subscribers.
+   *
+   * When the given iteratee goes either into the Done or Error state, we'll complete the given promise.
+   */
   private class IterateeSubscriber[E, A](it0: Iteratee[E, A], outcome: Promise[Iteratee[E, A]])
                                           (implicit ec: ExecutionContext)
       extends Subscriber[E] {
@@ -199,7 +193,7 @@ object Streams {
         })
       }
 
-      /** Fulfills the promise, cancels the subscription and generally does */
+      /** Fulfills the promise, cancels the subscription and generally does all the cleanup required. */
       def completeWith(result: Try[Iteratee[E, A]]): Unit = {
         subscription.cancel()
         currentState = Completed
@@ -228,7 +222,7 @@ object Streams {
       case class Folding(current: Iteratee[E, A], mostRecentInput: Input[E]) extends Subscriber[E] {
         override def onSubscribe(s: Subscription): Unit = onAlreadySubscribed
         override def onNext(elem: E): Unit              = completeWith(Success(
-          Error(s"Received addition input while we're still foldering over the current iteratee's state, i.e. " +
+          Error(s"Received addition input while we're still folding over the current iteratee's state, i.e. " +
             s"we haven't requested this element at all!", Input.El(elem))))
         override def onComplete(): Unit                 = completeWith(Success(current))
         override def onError(error: Throwable): Unit    = completeWith(Success(

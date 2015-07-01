@@ -125,7 +125,6 @@ case class AkkaWSRequestHolder(
   // -------------------------------------------- Utility methods
 
   private def prepareAndExecute(): Future[HttpResponse] = {
-    val connection = Http().outgoingConnection(uri.authority.host.address(), uri.effectivePort)
     val request = HttpRequest()
       .withMethod(
         HttpMethods.getForKey(method).getOrElse(
@@ -136,7 +135,11 @@ case class AkkaWSRequestHolder(
       .withEntity(entity)
 
     Source.single(request)
-      .via(connection)
+      .via(if (uri.scheme == "https") {
+        Http().outgoingConnectionTls(uri.authority.host.address(), uri.effectivePort)
+      } else {
+        Http().outgoingConnection(uri.authority.host.address(), uri.effectivePort)
+      })
       .runWith(Sink.head)
       .flatMap({ response =>
         maybeFollowRedirects(response)
